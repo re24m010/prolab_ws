@@ -5,10 +5,11 @@
 #include <cmath>
 #include <vector>
 #include <random>
+#include <numeric>
+#include <algorithm>
 
 #include "rclcpp/rclcpp.hpp"
-#include "geometry_msgs/msg/twist.hpp"
-#include "geometry_msgs/msg/pose_stamped.hpp"
+#include "geometry_msgs/msg/pose_with_covariance_stamped.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 
 using namespace std::chrono_literals;
@@ -16,176 +17,245 @@ using namespace std::chrono_literals;
 struct Particle {
     double x;
     double y;
-    double theta;
+    double yaw;
     double weight;
 };
 
 class ParticleFilterNode : public rclcpp::Node
 {
 public:
-    ParticleFilterNode() : Node("particleFilter_node"), current_v_(0.0), current_w_(0.0), num_particles_(150)
+    ParticleFilterNode() : Node("particleFilter_node"), num_particles_(100), is_initialized_(false)
     {
-        // Publisher für die PF Schätzung
-        pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>("/estimated_pose_pf", 10);
+        pf_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
+            "/estimated_pose_pf", 10);
 
-        // Subscriptions
-        cmd_sub_ = this->create_subscription<geometry_msgs::msg::Twist>(
-            "/cmd_vel", 10, std::bind(&ParticleFilterNode::motionCallback, this, std::placeholders::_1));
-            
         odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-            "/odom", 10, std::bind(&ParticleFilterNode::measurementCallback, this, std::placeholders::_1));
+            "/odom_noisy", 10, std::bind(&ParticleFilterNode::odomCallback, this, std::placeholders::_1));
 
-        // Random Number Generator initialisieren
+        // Landmarke im Ursprung (0, 0)
+        landmark_x_ = 0.0;
+        landmark_y_ = 0.0;
+
+        // Messrauschen-Standardabweichungen
+        sigma_range_ = 0.2;
+        sigma_bearing_ = 0.1;
+
+        // Zufallsgenerator
         std::random_device rd;
-        gen_.seed(rd());
-
-        // Partikelschwarm initialisieren (alle starten nahe [0,0,0] mit gleichem Gewicht)
-        std::normal_distribution<double> d_x(0.0, 0.05);
-        std::normal_distribution<double> d_y(0.0, 0.05);
-        std::normal_distribution<double> d_th(0.0, 0.05);
-
-        particles_.resize(num_particles_);
-        for (int i = 0; i < num_particles_; ++i) {
-            particles_[i].x = d_x(gen_);
-            particles_[i].y = d_y(gen_);
-            particles_[i].theta = d_th(gen_);
-            particles_[i].weight = 1.0 / num_particles_;
-        }
+        gen_ = std::default_random_engine(rd());
 
         last_time_ = this->now();
-        RCLCPP_INFO(this->get_logger(), "C++ Partikelfilter Node (particleFilter_node) gestartet.");
+        RCLCPP_INFO(this->get_logger(), "Mathematischer PF (Option A + PoseWithCovarianceStamped) gestartet.");
     }
 
 private:
-    void motionCallback(const geometry_msgs::msg::Twist::SharedPtr msg)
+    int num_particles_;
+    std::vector<Particle> particles_;
+    bool is_initialized_;
+
+    double landmark_x_;
+    double landmark_y_;
+    double sigma_range_;
+    double sigma_bearing_;
+
+    std::default_random_engine gen_;
+    rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pf_pose_pub_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+    rclcpp::Time last_time_;
+
+    static double normalizeAngle(double angle)
     {
-        current_v_ = msg->linear.x;
-        current_w_ = msg->angular.z;
+        return std::atan2(std::sin(angle), std::cos(angle));
     }
 
-    void measurementCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
+    double gaussianProb(double diff, double sigma)
     {
+        return std::exp(-0.5 * std::pow(diff / sigma, 2.0)) / (std::sqrt(2.0 * M_PI) * sigma);
+    }
+
+    void initializeParticles(double x0, double y0, double yaw0)
+    {
+        std::normal_distribution<double> dist_pos(0.0, 0.05);
+        std::normal_distribution<double> dist_yaw(0.0, 0.02);
+
+        particles_.clear();
+        particles_.resize(num_particles_);
+        for (int i = 0; i < num_particles_; ++i) {
+            particles_[i].x = x0 + dist_pos(gen_);
+            particles_[i].y = y0 + dist_pos(gen_);
+            particles_[i].yaw = normalizeAngle(yaw0 + dist_yaw(gen_));
+            particles_[i].weight = 1.0 / num_particles_;
+        }
+        is_initialized_ = true;
+    }
+
+    void odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
+    {
+        auto t_start = std::chrono::high_resolution_clock::now();
+
         rclcpp::Time now = this->now();
         double dt = (now - last_time_).seconds();
         last_time_ = now;
 
-        if (dt <= 0.0) return;
+        if (dt <= 0.0 || dt > 0.5) return;
 
-        // Rausch-Generatoren für die Partikelbewegung (Process Noise Q Simulation)
-        // AUFGABE: Werte im Experiment variieren!
-        std::normal_distribution<double> noise_v(0.0, 0.02);
-        std::normal_distribution<double> noise_w(0.0, 0.05);
+        double odom_x = msg->pose.pose.position.x;
+        double odom_y = msg->pose.pose.position.y;
+        double q_z = msg->pose.pose.orientation.z;
+        double q_w = msg->pose.pose.orientation.w;
+        double odom_yaw = 2.0 * std::atan2(q_z, q_w);
 
-        // --- 1. PRÄDIKTION (Jeden Partikel einzeln bewegen + Rauschen addieren) ---
-        for (int i = 0; i < num_particles_; ++i) {
-            double v_noisy = current_v_ + noise_v(gen_);
-            double w_noisy = current_w_ + noise_w(gen_);
-
-            particles_[i].x += v_noisy * std::cos(particles_[i].theta) * dt;
-            particles_[i].y += v_noisy * std::sin(particles_[i].theta) * dt;
-            particles_[i].theta += w_noisy * dt;
-            particles_[i].theta = std::atan2(std::sin(particles_[i].theta), std::cos(particles_[i].theta));
+        if (!is_initialized_) {
+            initializeParticles(odom_x, odom_y, odom_yaw);
+            return;
         }
 
-        // --- 2. MESS-UPDATE (Gewichtung basierend auf Sensorwerten) ---
-        double z_x = msg->pose.pose.position.x;
-        double z_y = msg->pose.pose.position.y;
-        
-        // Sensorrauschen-Annahme R
-        // AUFGABE: Werte im Experiment variieren!
-        double sigma_sensor = 0.1; 
-        double weight_sum = 0.0;
+        double v = msg->twist.twist.linear.x;
+        double w = msg->twist.twist.angular.z;
 
-        for (int i = 0; i < num_particles_; ++i) {
-            // Euklidischer Abstand zwischen Partikel-Hypothese und echter Messung
-            double dist_x = z_x - particles_[i].x;
-            double dist_y = z_y - particles_[i].y;
-            double distance = std::sqrt(dist_x * dist_x + dist_y * dist_y);
+        // ==========================================
+        // 1. PRÄDIKTION (Propagierung mit Prozessrauschen)
+        // ==========================================
+        std::normal_distribution<double> noise_v(0.0, 0.03);
+        std::normal_distribution<double> noise_w(0.0, 0.02);
 
-            // Gaußsche Wahrscheinlichkeitsdichte als Gewicht (je näher am Sensor, desto höher das Gewicht)
-            particles_[i].weight = std::exp(-(distance * distance) / (2.0 * sigma_sensor * sigma_sensor));
-            weight_sum += particles_[i].weight;
+        for (auto& p : particles_) {
+            double v_p = v + noise_v(gen_);
+            double w_p = w + noise_w(gen_);
+
+            p.x += v_p * std::cos(p.yaw) * dt;
+            p.y += v_p * std::sin(p.yaw) * dt;
+            p.yaw = normalizeAngle(p.yaw + w_p * dt);
         }
 
-        // Gewichte normalisieren (Summe muss 1.0 ergeben)
-        if (weight_sum > 0.0) {
-            for (int i = 0; i < num_particles_; ++i) {
-                particles_[i].weight /= weight_sum;
-            }
-        } else {
-            // Falls alle Partikel zu weit weg waren, Gewichte gleichmäßig verteilen
-            for (int i = 0; i < num_particles_; ++i) {
-                particles_[i].weight = 1.0 / num_particles_;
-            }
+        // ==========================================
+        // 2. KORREKTUR (Messmodell & Gewichtung)
+        // ==========================================
+        // Landmarken-Messung aus verrauschter Odometrie generieren
+        double dx_meas = landmark_x_ - odom_x;
+        double dy_meas = landmark_y_ - odom_y;
+        double z_range = std::sqrt(dx_meas * dx_meas + dy_meas * dy_meas);
+        double z_bearing = normalizeAngle(std::atan2(dy_meas, dx_meas) - odom_yaw);
+
+        double total_weight = 0.0;
+        for (auto& p : particles_) {
+            double dx_p = landmark_x_ - p.x;
+            double dy_p = landmark_y_ - p.y;
+            double pred_range = std::sqrt(dx_p * dx_p + dy_p * dy_p);
+            double pred_bearing = normalizeAngle(std::atan2(dy_p, dx_p) - p.yaw);
+
+            double diff_range = z_range - pred_range;
+            double diff_bearing = normalizeAngle(z_bearing - pred_bearing);
+
+            // Likelihood aus Gauß-Dichten
+            double p_r = gaussianProb(diff_range, sigma_range_);
+            double p_b = gaussianProb(diff_bearing, sigma_bearing_);
+            p.weight = p_r * p_b + 1e-9; // Numerische Stabilität
+            total_weight += p.weight;
         }
 
-        // --- 3. RESAMPLING (Systematische Auswahl starker Partikel) ---
+        // Gewichte normalisieren
+        for (auto& p : particles_) {
+            p.weight /= total_weight;
+        }
+
+        // ==========================================
+        // 3. SYSTEMATISCHES RESAMPLING (Low-Variance)
+        // ==========================================
         std::vector<Particle> new_particles;
         new_particles.reserve(num_particles_);
-        
-        std::uniform_real_distribution<double> uni_dist(0.0, 1.0 / num_particles_);
-        double r = uni_dist(gen_);
+
+        std::uniform_real_distribution<double> dist_u(0.0, 1.0 / num_particles_);
+        double r = dist_u(gen_);
         double c = particles_[0].weight;
         int idx = 0;
 
-        for (int i = 0; i < num_particles_; ++i) {
-            double u = r + i * (1.0 / num_particles_);
+        for (int m = 0; m < num_particles_; ++m) {
+            double u = r + (double)m / num_particles_;
             while (u > c && idx < num_particles_ - 1) {
                 idx++;
                 c += particles_[idx].weight;
             }
             new_particles.push_back(particles_[idx]);
-            new_particles.back().weight = 1.0 / num_particles_; // Gewicht zurücksetzen
+            new_particles.back().weight = 1.0 / num_particles_;
         }
-        particles_ = new_particles;
+        particles_ = std::move(new_particles);
 
-        // --- 4. ZUSTANDSSCHÄTZUNG (Mittelwert aller Partikel berechnen) ---
-        double mean_x = 0.0;
-        double mean_y = 0.0;
-        double mean_sin = 0.0;
-        double mean_cos = 0.0;
+        // ==========================================
+        // 4. ZUSTAND & KOVARIANZ BERECHNEN
+        // ==========================================
+        double mean_x = 0.0, mean_y = 0.0;
+        double sum_sin = 0.0, sum_cos = 0.0;
 
-        for (int i = 0; i < num_particles_; ++i) {
-            mean_x += particles_[i].x;
-            mean_y += particles_[i].y;
-            mean_sin += std::sin(particles_[i].theta);
-            mean_cos += std::cos(particles_[i].theta);
+        for (const auto& p : particles_) {
+            mean_x += p.x;
+            mean_y += p.y;
+            sum_sin += std::sin(p.yaw);
+            sum_cos += std::cos(p.yaw);
         }
+        mean_x /= num_particles_;
+        mean_y /= num_particles_;
+        double mean_yaw = std::atan2(sum_sin, sum_cos);
 
-        double est_x = mean_x / num_particles_;
-        double est_y = mean_y / num_particles_;
-        double est_th = std::atan2(mean_sin, mean_cos);
+        // Empirische Kovarianz der Partikelwolke
+        double cov_xx = 0.0, cov_yy = 0.0, cov_xy = 0.0, cov_yaw = 0.0;
+        for (const auto& p : particles_) {
+            double dx = p.x - mean_x;
+            double dy = p.y - mean_y;
+            double dyaw = normalizeAngle(p.yaw - mean_yaw);
 
-        publishPose(est_x, est_y, est_th);
+            cov_xx += dx * dx;
+            cov_yy += dy * dy;
+            cov_xy += dx * dy;
+            cov_yaw += dyaw * dyaw;
+        }
+        cov_xx /= num_particles_;
+        cov_yy /= num_particles_;
+        cov_xy /= num_particles_;
+        cov_yaw /= num_particles_;
+
+        // ==========================================
+        // 5. PUBLISH MIT KOVARIANZ (RViz-Crash-Safe)
+        // ==========================================
+        geometry_msgs::msg::PoseWithCovarianceStamped pose_msg;
+        pose_msg.header.stamp = now;
+        pose_msg.header.frame_id = "odom";
+
+        pose_msg.pose.pose.position.x = mean_x;
+        pose_msg.pose.pose.position.y = mean_y;
+        pose_msg.pose.pose.position.z = 0.0;
+
+        double half_yaw = mean_yaw / 2.0;
+        pose_msg.pose.pose.orientation.z = std::sin(half_yaw);
+        pose_msg.pose.pose.orientation.w = std::cos(half_yaw);
+
+        pose_msg.pose.covariance.fill(0.0);
+        pose_msg.pose.covariance[0]  = std::max(1e-4, cov_xx);
+        pose_msg.pose.covariance[1]  = cov_xy;
+        pose_msg.pose.covariance[6]  = cov_xy;
+        pose_msg.pose.covariance[7]  = std::max(1e-4, cov_yy);
+
+        // Stabilisierung gegen RViz-Division durch 0
+        pose_msg.pose.covariance[14] = 1e-4; // z
+        pose_msg.pose.covariance[21] = 1e-4; // roll
+        pose_msg.pose.covariance[28] = 1e-4; // pitch
+        pose_msg.pose.covariance[35] = std::max(1e-4, cov_yaw);
+
+        pf_pose_pub_->publish(pose_msg);
+
+        auto t_end = std::chrono::high_resolution_clock::now();
+        double elapsed_us = std::chrono::duration<double, std::micro>(t_end - t_start).count();
+
+        static int step_counter = 0;
+        static double total_time = 0.0;
+        total_time += elapsed_us;
+        step_counter++;
+
+        if (step_counter % 50 == 0) {
+            RCLCPP_INFO(this->get_logger(), "[PF] Mittlere Laufzeit: %.2f µs", total_time / 50.0);
+            total_time = 0.0;
+        }
     }
-
-    void publishPose(double x, double y, double th)
-    {
-        geometry_msgs::msg::PoseStamped msg;
-        msg.header.stamp = this->now();
-        msg.header.frame_id = "odom";
-
-        msg.pose.position.x = x;
-        msg.pose.position.y = y;
-        msg.pose.position.z = 0.0;
-
-        double half_theta = th / 2.0;
-        msg.pose.orientation.z = std::sin(half_theta);
-        msg.pose.orientation.w = std::cos(half_theta);
-
-        pose_pub_->publish(msg);
-    }
-
-    rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_pub_;
-    rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_sub_;
-    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
-
-    std::vector<Particle> particles_;
-    int num_particles_;
-    double current_v_;
-    double current_w_;
-    rclcpp::Time last_time_;
-    std::mt19937 gen_;
 };
 
 int main(int argc, char *argv[])

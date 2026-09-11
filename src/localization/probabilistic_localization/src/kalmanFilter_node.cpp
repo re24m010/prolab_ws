@@ -3,11 +3,12 @@
 #include <memory>
 #include <string>
 #include <cmath>
-#include <vector>
+#include <algorithm>
+#include <Eigen/Dense>
 
 #include "rclcpp/rclcpp.hpp"
 #include "geometry_msgs/msg/twist.hpp"
-#include "geometry_msgs/msg/pose_stamped.hpp"
+#include "geometry_msgs/msg/pose_with_covariance_stamped.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 
 using namespace std::chrono_literals;
@@ -15,41 +16,53 @@ using namespace std::chrono_literals;
 class KalmanFilterNode : public rclcpp::Node
 {
 public:
-    KalmanFilterNode() : Node("kalmanFilter_node"), current_v_(0.0), current_w_(0.0)
+    KalmanFilterNode() : Node("kalmanFilter_node"), current_v_(0.0), current_w_(0.0), is_initialized_(false)
     {
-        // Publisher für die geschätzte Pose
-        pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>("/estimated_pose_kf", 10);
+        pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
+            "/estimated_pose_kf", 10);
 
-        // Subscriber für Geschwindigkeitsbefehle und Odometrie
         cmd_sub_ = this->create_subscription<geometry_msgs::msg::Twist>(
             "/cmd_vel", 10, std::bind(&KalmanFilterNode::motionCallback, this, std::placeholders::_1));
-            
+
         odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-            "/odom", 10, std::bind(&KalmanFilterNode::measurementCallback, this, std::placeholders::_1));
+            "/odom_noisy", 10, std::bind(&KalmanFilterNode::measurementCallback, this, std::placeholders::_1));
 
-        // Initialisierung des Systemzustands [x, y, theta]
-        x_ = {0.0, 0.0, 0.0};
+        x_ = Eigen::Vector3d::Zero();
+        P_ = Eigen::Matrix3d::Identity() * 0.1;
 
-        // Zustandskovarianz P (Anfangsungewissheit)
-        P_ = {0.1, 0.0, 0.0,
-              0.0, 0.1, 0.0,
-              0.0, 0.0, 0.1};
+        Q_ = Eigen::Matrix3d::Zero();
+        Q_(0, 0) = 0.02;
+        Q_(1, 1) = 0.02;
+        Q_(2, 2) = 0.05;
 
-        // Prozessrauschen Q (Modell-Unsicherheit) -> AUFGABE: Im Experiment variieren!
-        Q_ = {0.02, 0.0,  0.0,
-              0.0,  0.02, 0.0,
-              0.0,  0.0,  0.05};
-
-        // Messrauschen R (Sensor-Unsicherheit) -> AUFGABE: Im Experiment variieren!
-        R_ = {0.1, 0.0, 0.0,
-              0.0, 0.1, 0.0,
-              0.0, 0.0, 0.2};
+        R_ = Eigen::Matrix3d::Zero();
+        R_(0, 0) = 0.1;
+        R_(1, 1) = 0.1;
+        R_(2, 2) = 0.2;
 
         last_time_ = this->now();
-        RCLCPP_INFO(this->get_logger(), "C++ Kalman Filter Node (kalmanFilter_node) erfolgreich gestartet.");
     }
 
 private:
+    Eigen::Vector3d x_;
+    Eigen::Matrix3d P_;
+    Eigen::Matrix3d Q_;
+    Eigen::Matrix3d R_;
+
+    double current_v_;
+    double current_w_;
+    rclcpp::Time last_time_;
+    bool is_initialized_;
+
+    rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pose_pub_;
+    rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_sub_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+
+    static double normalizeAngle(double angle)
+    {
+        return std::atan2(std::sin(angle), std::cos(angle));
+    }
+
     void motionCallback(const geometry_msgs::msg::Twist::SharedPtr msg)
     {
         current_v_ = msg->linear.x;
@@ -58,127 +71,100 @@ private:
 
     void measurementCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
     {
+        // Am Anfang der Berechnungen in measurementCallback:
+        auto t_start = std::chrono::high_resolution_clock::now();
+
+
         rclcpp::Time now = this->now();
         double dt = (now - last_time_).seconds();
         last_time_ = now;
 
-        if (dt <= 0.0) return;
+        if (dt <= 0.0 || dt > 0.5) return;
 
-        // --- 1. PRÄDIKTION (Prediction Step) ---
+        double q_z = msg->pose.pose.orientation.z;
+        double q_w = msg->pose.pose.orientation.w;
+        double yaw_measured = 2.0 * std::atan2(q_z, q_w);
+
+        Eigen::Vector3d z(
+            msg->pose.pose.position.x,
+            msg->pose.pose.position.y,
+            yaw_measured
+        );
+
+        if (!is_initialized_) {
+            x_ = z;
+            is_initialized_ = true;
+            return;
+        }
+
+        // 1. Prädiktion
         double theta_old = x_[2];
-        
-        // Zustand vorhersagen (A-Priori)
         x_[0] += current_v_ * std::cos(theta_old) * dt;
         x_[1] += current_v_ * std::sin(theta_old) * dt;
         x_[2] += current_w_ * dt;
+        x_[2] = normalizeAngle(x_[2]);
 
-        // Da es ein lineares KF ist, nehmen wir die Jacobi/Übergangsmatrix F als Identitätsmatrix an.
-        // P = F * P * F^T + Q -> Da F = I, gilt einfach: P = P + Q
-        for (size_t i = 0; i < 9; ++i) {
-            P_[i] += Q_[i];
-        }
+        P_ = P_ + Q_;
 
-        // --- 2. KORREKTUR (Update Step) ---
-        // Messvektor z aus der verrauschten Odometrie holen
-        std::vector<double> z = {
-            msg->pose.pose.position.x,
-            msg->pose.pose.position.y,
-            x_[2] // Zur Stabilisierung der Orientierung im linearen Filter
-        };
+        // 2. Korrektur
+        Eigen::Vector3d y = z - x_;
+        y[2] = normalizeAngle(y[2]);
 
-        // Innovation (Messabweichung) y = z - H*x (H ist Identitätsmatrix)
-        std::vector<double> y = { z[0] - x_[0], z[1] - x_[1], z[2] - x_[2] };
+        Eigen::Matrix3d S = P_ + R_;
+        Eigen::Matrix3d K = P_ * S.inverse();
 
-        // Innovationskovarianz S = H * P * H^T + R -> Da H = I, gilt S = P + R
-        std::vector<double> S(9);
-        for (size_t i = 0; i < 9; ++i) {
-            S[i] = P_[i] + R_[i];
-        }
+        x_ = x_ + K * y;
+        x_[2] = normalizeAngle(x_[2]);
 
-        // Invertierung der 3x3 Matrix S (Determinanten-Methode)
-        double det = S[0]*(S[4]*S[8] - S[5]*S[7]) - S[1]*(S[3]*S[8] - S[5]*S[6]) + S[2]*(S[3]*S[7] - S[4]*S[6]);
-        if (std::abs(det) < 1e-6) return; // Schutz vor Division durch Null
+        Eigen::Matrix3d I = Eigen::Matrix3d::Identity();
+        P_ = (I - K) * P_;
 
-        double inv_det = 1.0 / det;
-        std::vector<double> S_inv(9);
-        S_inv[0] = (S[4]*S[8] - S[5]*S[7]) * inv_det;
-        S_inv[1] = (S[2]*S[8] - S[1]*S[8]) * inv_det; // Vereinfachte Kofaktormatrix
-        S_inv[2] = (S[1]*S[5] - S[2]*S[4]) * inv_det;
-        S_inv[3] = (S[5]*S[6] - S[3]*S[8]) * inv_det;
-        S_inv[4] = (S[0]*S[8] - S[2]*S[6]) * inv_det;
-        S_inv[5] = (S[2]*S[3] - S[0]*S[5]) * inv_det;
-        S_inv[6] = (S[3]*S[7] - S[4]*S[6]) * inv_det;
-        S_inv[7] = (S[1]*S[6] - S[0]*S[7]) * inv_det;
-        S_inv[8] = (S[0]*S[4] - S[1]*S[3]) * inv_det;
+        // 3. Veröffentlichung (RViz-Crash-Safe)
+        geometry_msgs::msg::PoseWithCovarianceStamped pose_msg;
+        pose_msg.header.stamp = now;
+        pose_msg.header.frame_id = "odom";
 
-        // Kalman-Gain berechnen: K = P * S_inv (Da H = I)
-        std::vector<double> K(9, 0.0);
-        for (int r = 0; r < 3; ++r) {
-            for (int c = 0; c < 3; ++c) {
-                for (int k = 0; k < 3; ++k) {
-                    K[r*3 + c] += P_[r*3 + k] * S_inv[k*3 + c];
-                }
-            }
-        }
+        pose_msg.pose.pose.position.x = x_[0];
+        pose_msg.pose.pose.position.y = x_[1];
+        pose_msg.pose.pose.position.z = 0.0;
 
-        // Zustand korrigieren (A-Posteriori): x = x + K * y
-        x_[0] += K[0]*y[0] + K[1]*y[1] + K[2]*y[2];
-        x_[1] += K[3]*y[0] + K[4]*y[1] + K[5]*y[2];
-        x_[2] += K[6]*y[0] + K[7]*y[1] + K[8]*y[2];
-
-        // Kovarianz korrigieren: P = (I - K)*P
-        std::vector<double> I_minus_K = {
-            1.0 - K[0], -K[1],      -K[2],
-            -K[3],      1.0 - K[4], -K[5],
-            -K[6],      -K[7],      1.0 - K[8]
-        };
-        
-        std::vector<double> P_new(9, 0.0);
-        for (int r = 0; r < 3; ++r) {
-            for (int c = 0; c < 3; ++c) {
-                for (int k = 0; k < 3; ++k) {
-                    P_new[r*3 + c] += I_minus_K[r*3 + k] * P_[k*3 + c];
-                }
-            }
-        }
-        P_ = P_new;
-
-        // Schätzung an RViz senden
-        publishPose();
-    }
-
-    void publishPose()
-    {
-        geometry_msgs::msg::PoseStamped msg;
-        msg.header.stamp = this->now();
-        msg.header.frame_id = "odom"; // Laut Aufgabenstellung gleicher Bezugsrahmen
-
-        msg.pose.position.x = x_[0];
-        msg.pose.position.y = x_[1];
-        msg.pose.position.z = 0.0;
-
-        // Euler-Winkel in Quaternion umrechnen
         double half_theta = x_[2] / 2.0;
-        msg.pose.orientation.z = std::sin(half_theta);
-        msg.pose.orientation.w = std::cos(half_theta);
+        pose_msg.pose.pose.orientation.z = std::sin(half_theta);
+        pose_msg.pose.pose.orientation.w = std::cos(half_theta);
 
-        pose_pub_->publish(msg);
+        pose_msg.pose.covariance.fill(0.0);
+        pose_msg.pose.covariance[0]  = std::max(1e-4, P_(0, 0));
+        pose_msg.pose.covariance[1]  = P_(0, 1);
+        pose_msg.pose.covariance[5]  = P_(0, 2);
+
+        pose_msg.pose.covariance[6]  = P_(1, 0);
+        pose_msg.pose.covariance[7]  = std::max(1e-4, P_(1, 1));
+        pose_msg.pose.covariance[11] = P_(1, 2);
+
+        pose_msg.pose.covariance[14] = 1e-4; // z
+        pose_msg.pose.covariance[21] = 1e-4; // roll
+        pose_msg.pose.covariance[28] = 1e-4; // pitch
+
+        pose_msg.pose.covariance[30] = P_(2, 0);
+        pose_msg.pose.covariance[31] = P_(2, 1);
+        pose_msg.pose.covariance[35] = std::max(1e-4, P_(2, 2));
+
+        pose_pub_->publish(pose_msg);
+
+        auto t_end = std::chrono::high_resolution_clock::now();
+        double elapsed_us = std::chrono::duration<double, std::micro>(t_end - t_start).count();
+
+        // Gedrosseltes Logging (z. B. alle 50 Schritte), um das Terminal nicht zu überfluten:
+        static int step_counter = 0;
+        static double total_time = 0.0;
+        total_time += elapsed_us;
+        step_counter++;
+
+        if (step_counter % 50 == 0) {
+            RCLCPP_INFO(this->get_logger(), "Mittlere Ausführungszeit (letzte 50 Schritte): %.2f µs", total_time / 50.0);
+            total_time = 0.0;
+        }
     }
-
-    // ROS 2 Kommunikations-Objekte
-    rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_pub_;
-    rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_sub_;
-    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
-
-    // Filtervariablen (Zustand und Matrizen als abgeflachte 1D-Vektoren)
-    std::vector<double> x_;
-    std::vector<double> P_;
-    std::vector<double> Q_;
-    std::vector<double> R_;
-
-    double current_v_;
-    double current_w_;
-    rclcpp::Time last_time_;
 };
 
 int main(int argc, char *argv[])

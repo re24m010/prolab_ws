@@ -2,40 +2,45 @@ from launch import LaunchDescription
 from launch_ros.actions import Node
 
 def generate_launch_description():
-    return LaunchDescription([
-        # 1. Kalman Filter Node
-        Node(
-            package='probabilistic_localization',
-            executable='kalmanFilter_node',
-            name='kalmanFilter_node',
-            output='screen',
-            parameters=[{'use_sim_time': True}]
-        ),
-        
-        # 2. Extended Kalman Filter Node
-        Node(
-            package='probabilistic_localization',
-            executable='extendedKalmanFilter_node',
-            name='extendedKalmanFilter_node',
-            output='screen',
-            parameters=[{'use_sim_time': True}]
-        ),
+    kf_node = Node(
+        package='probabilistic_localization',
+        executable='kalmanFilter_node',
+        name='kalmanFilter_node',
+        output='screen'
+    )
 
-        # 3. Partikelfilter Node
-        Node(
-            package='probabilistic_localization',
-            executable='particleFilter_node',
-            name='particleFilter_node',
-            output='screen',
-            parameters=[{'use_sim_time': True}]
-        ),
-        
-        # 4. Automatischer Trajektorien-Generator (Steuerung)
-        Node(
-            package='probabilistic_localization',
-            executable='trajectory_node',
-            name='trajectory_node',
-            output='screen',
-            parameters=[{'use_sim_time': True}]
-        )
+    ekf_node = Node(
+        package='probabilistic_localization',
+        executable='extendedKalmanFilter_node',
+        name='extendedKalmanFilter_node',
+        output='screen'
+    )
+
+    pf_node = Node(
+        package='probabilistic_localization',
+        executable='particleFilter_node',
+        name='particleFilter_node',
+        output='screen'
+    )
+
+    noise_node = Node(
+        package='probabilistic_localization',
+        executable='noise_simulator_node',
+        name='noise_simulator_node',
+        output='screen'
+    )
+
+    trajectory_node = Node(
+        package='probabilistic_localization',
+        executable='infinity_node',
+        name='infinity_node',
+        output='screen'
+    )
+
+    return LaunchDescription([
+        noise_node,
+        kf_node,
+        ekf_node,
+        pf_node,
+        trajectory_node
     ])
