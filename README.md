@@ -1,3 +1,9 @@
+cat << 'EOF' > ~/prolab_ws/README.md
+# Probabilistic Localization for TurtleBot4 (ROS 2 Humble)
+
+This repository contains the implementation, benchmarking, and comparative evaluation of three probabilistic state estimation algorithms (**Kalman Filter**, **Extended Kalman Filter**, and **Particle Filter**) for an autonomous mobile robot (TurtleBot4) in ROS 2 Humble.
+
+---
 Probabilistic Localization for TurtleBot4 (ROS 2 Humble)This repository contains the implementation, benchmarking, and comparative evaluation of three probabilistic state estimation algorithms (Kalman Filter, Extended Kalman Filter, and Particle Filter) for an autonomous mobile robot (TurtleBot4) in ROS 2 Humble.1. Project OverviewThe system estimates the 2D planar pose $(x, y, \theta)$ of a mobile robot following an autonomous four-waypoint trajectory under synthetic sensor degradation:Linear Kalman Filter (KF): Linear state transition and measurement model using direct odometry observations.Extended Kalman Filter (EKF): Non-linear differential drive unicycle kinematics linearized via first-order Taylor expansion (Jacobian matrices $G_t$ and $H_t$), integrating relative landmark observations at $(0, 0)$.Particle Filter (PF / Monte Carlo Localization): Non-parametric filter using $M=100$ samples with non-linear motion propagation, Gaussian likelihood weighting against landmark measurements, and low-variance resampling.2. Repository StructurePlaintextprolab_ws/
 ├── Plots/
 │   ├── filter_error_plot1.png
